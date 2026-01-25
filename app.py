@@ -291,6 +291,12 @@ def get_owner_positions(owner_address: str) -> pd.DataFrame:
         for pos, pool in positions:
             pool_name = f"{pool.token0_symbol}/{pool.token1_symbol}" if pool else pos.pool_address[:10]
             
+            # Платформа (DEX)
+            dex_name = pos.dex.upper().replace("_", " ") if pos.dex else "Uniswap V3"
+            
+            # Адрес LP пула
+            pool_addr = pos.pool_address if pos.pool_address else "-"
+            
             # Рассчитаем PnL
             dep = float(pos.deposited_usd or 0)
             wit = float(pos.withdrawn_usd or 0)
@@ -298,8 +304,10 @@ def get_owner_positions(owner_address: str) -> pd.DataFrame:
             pnl = wit + fees - dep if pos.is_closed else 0
             
             data.append({
-                "Пул": pool_name,
+                "Платформа": dex_name,
                 "Сеть": pos.network,
+                "Пул": pool_name,
+                "Адрес LP": pool_addr,
                 "Статус": "🔒 Закрыта" if pos.is_closed else "🟢 Открыта",
                 "Диапазон": f"{pos.tick_lower} → {pos.tick_upper}",
                 "Депозит ($)": round(dep, 2),
@@ -1180,6 +1188,7 @@ elif page == "👁️ Мониторинг":
                 
                 # Показываем позиции
                 st.markdown("#### 📋 Позиции владельца:")
+                st.code(w["address"], language=None)
                 pos_df = get_owner_positions(w["address"])
                 
                 if not pos_df.empty:
