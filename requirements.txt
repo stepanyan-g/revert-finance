@@ -1,0 +1,39 @@
+# Core dependencies
+requests>=2.31.0
+sqlalchemy>=2.0.0
+
+# Database
+# For SQLite (included in Python)
+# For PostgreSQL, uncomment:
+# psycopg2-binary>=2.9.9
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Web UI
+streamlit>=1.30.0
+plotly>=5.18.0
+
+# Web3 (optional, for direct RPC calls)
+# web3>=6.0.0
+
+# Async support (optional)
+# aiohttp>=3.9.0
+# asyncio>=3.4.3
+
+# Scheduling
+schedule>=1.2.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Development
+pytest>=7.4.0
+pytest-cov>=4.1.0
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.5.0
+
+# Type stubs
+types-requests>=2.31.0
