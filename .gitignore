@@ -12,7 +12,7 @@ ENV/
 
 # Database
 *.db
-data/
+/data/
 
 # IDE
 .idea/
