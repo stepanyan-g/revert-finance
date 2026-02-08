@@ -163,7 +163,10 @@ class OwnerAnalyzer:
         Returns:
             OwnerMetrics with all calculated values
         """
-        query = session.query(Position).filter(Position.owner_id == owner.id)
+        # Query by owner_address (always set) rather than owner_id (may be NULL)
+        query = session.query(Position).filter(
+            Position.owner_address == owner.address.lower()
+        )
         
         if network:
             query = query.filter(Position.network == network)

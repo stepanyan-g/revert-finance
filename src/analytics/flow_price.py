@@ -139,30 +139,41 @@ class FlowPriceAnalyzer:
         token_data: dict[tuple[str, str], dict] = {}
         
         for swap, pool in swaps:
-            # Process both tokens in the pair
-            for token_addr, token_sym in [
-                (pool.token0_address, pool.token0_symbol),
-                (pool.token1_address, pool.token1_symbol),
-            ]:
-                key = (token_addr, pool.network)
-                
-                if key not in token_data:
-                    token_data[key] = {
-                        "token_address": token_addr,
-                        "token_symbol": token_sym or "???",
-                        "network": pool.network,
-                        "inflow_usd": 0,
-                        "outflow_usd": 0,
-                        "swap_count": 0,
-                    }
-                
-                amount = float(swap.amount_usd or 0) / 2  # Split between tokens
-                token_data[key]["swap_count"] += 1
-                
-                if swap.direction == "buy":
-                    token_data[key]["inflow_usd"] += amount
-                else:
-                    token_data[key]["outflow_usd"] += amount
+            amount = float(swap.amount_usd or 0) / 2  # Split between tokens
+            
+            # Process token0
+            key0 = (pool.token0_address, pool.network)
+            if key0 not in token_data:
+                token_data[key0] = {
+                    "token_address": pool.token0_address,
+                    "token_symbol": pool.token0_symbol or "???",
+                    "network": pool.network,
+                    "inflow_usd": 0,
+                    "outflow_usd": 0,
+                    "swap_count": 0,
+                }
+            token_data[key0]["swap_count"] += 1
+            
+            # Process token1
+            key1 = (pool.token1_address, pool.network)
+            if key1 not in token_data:
+                token_data[key1] = {
+                    "token_address": pool.token1_address,
+                    "token_symbol": pool.token1_symbol or "???",
+                    "network": pool.network,
+                    "inflow_usd": 0,
+                    "outflow_usd": 0,
+                    "swap_count": 0,
+                }
+            token_data[key1]["swap_count"] += 1
+            
+            # Direction logic: "buy" means token0 was bought (inflow to token0, outflow from token1)
+            if swap.direction == "buy":
+                token_data[key0]["inflow_usd"] += amount
+                token_data[key1]["outflow_usd"] += amount
+            else:
+                token_data[key0]["outflow_usd"] += amount
+                token_data[key1]["inflow_usd"] += amount
         
         # Convert to FlowPriceData objects
         results = []

@@ -141,6 +141,40 @@ class SwapLoader:
 class SwapAnalyzer:
     """Analyzes swap data for flow patterns."""
     
+    def get_net_flow(
+        self,
+        session: Session,
+        pool_id: int,
+        hours: int = 24,
+    ) -> Dict[str, Any]:
+        """
+        Get net flow for a specific pool.
+        
+        Args:
+            session: SQLAlchemy session
+            pool_id: Pool ID to analyze
+            hours: Time period in hours
+            
+        Returns:
+            Dict with inflow_usd, outflow_usd, net_flow_usd, swap_count
+        """
+        start_time = datetime.utcnow() - timedelta(hours=hours)
+        
+        swaps = session.query(Swap).filter(
+            Swap.pool_id == pool_id,
+            Swap.timestamp >= start_time,
+        ).all()
+        
+        inflow = sum(float(s.amount_usd or 0) for s in swaps if s.direction == "buy")
+        outflow = sum(float(s.amount_usd or 0) for s in swaps if s.direction == "sell")
+        
+        return {
+            "inflow_usd": inflow,
+            "outflow_usd": outflow,
+            "net_flow_usd": inflow - outflow,
+            "swap_count": len(swaps),
+        }
+    
     def get_flow_by_token(
         self,
         session: Session,
