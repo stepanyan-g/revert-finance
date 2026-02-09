@@ -56,6 +56,7 @@ class SwapLoader:
             return 0
         
         start_time = int((datetime.utcnow() - timedelta(hours=hours)).timestamp())
+        end_time = int(datetime.utcnow().timestamp())
         loaded_count = 0
         skip = 0
         
@@ -68,6 +69,7 @@ class SwapLoader:
                         "first": min(self.page_size, limit - loaded_count),
                         "skip": skip,
                         "startTime": str(start_time),
+                        "endTime": str(end_time),
                     }
                 )
                 
@@ -90,6 +92,89 @@ class SwapLoader:
                 break
         
         return loaded_count
+    
+    def load_swaps_for_period(
+        self,
+        session: Session,
+        network: str,
+        start_date: datetime,
+        end_date: datetime,
+        limit: int = 500,
+    ) -> int:
+        """
+        Load swaps for all pools in a network for a specific date range.
+        
+        Args:
+            session: SQLAlchemy session
+            network: Network name
+            start_date: Start of period
+            end_date: End of period
+            limit: Maximum swaps per pool
+            
+        Returns:
+            Total number of swaps loaded
+        """
+        if not GRAPH_API_KEY:
+            logger.error("GRAPH_API_KEY not set")
+            return 0
+        
+        # Get pools for this network that have been loaded
+        pools = session.query(Pool).filter(Pool.network == network).all()
+        
+        if not pools:
+            logger.warning(f"No pools found for network {network}. Load pools first.")
+            return 0
+        
+        try:
+            client = SubgraphClient(network)
+        except ValueError as e:
+            logger.warning(f"Failed to create client for {network}: {e}")
+            return 0
+        
+        start_time = int(start_date.timestamp())
+        end_time = int(end_date.timestamp())
+        
+        total_loaded = 0
+        
+        for pool in pools:
+            loaded_count = 0
+            skip = 0
+            
+            while loaded_count < limit:
+                try:
+                    data = client.query(
+                        SWAPS_QUERY,
+                        variables={
+                            "poolId": pool.address,
+                            "first": min(self.page_size, limit - loaded_count),
+                            "skip": skip,
+                            "startTime": str(start_time),
+                            "endTime": str(end_time),
+                        }
+                    )
+                    
+                    swaps = data.get("swaps", [])
+                    if not swaps:
+                        break
+                    
+                    for swap_data in swaps:
+                        self._save_swap(session, pool, swap_data)
+                        loaded_count += 1
+                    
+                    skip += len(swaps)
+                    
+                    if len(swaps) < self.page_size:
+                        break
+                        
+                except Exception as e:
+                    logger.error(f"Error loading swaps for pool {pool.address}: {e}")
+                    break
+            
+            total_loaded += loaded_count
+        
+        session.commit()
+        logger.info(f"Loaded {total_loaded} swaps for {network} from {start_date} to {end_date}")
+        return total_loaded
     
     def _save_swap(self, session: Session, pool: Pool, data: dict) -> Swap:
         """Save or update a swap in the database."""

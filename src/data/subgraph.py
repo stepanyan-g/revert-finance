@@ -133,13 +133,13 @@ query getPools($first: Int!, $skip: Int!, $minTvl: BigDecimal!) {
 """
 
 SWAPS_QUERY = """
-query getSwaps($poolId: String!, $first: Int!, $skip: Int!, $startTime: BigInt!) {
+query getSwaps($poolId: String!, $first: Int!, $skip: Int!, $startTime: BigInt!, $endTime: BigInt) {
     swaps(
         first: $first
         skip: $skip
         orderBy: timestamp
         orderDirection: desc
-        where: { pool: $poolId, timestamp_gte: $startTime }
+        where: { pool: $poolId, timestamp_gte: $startTime, timestamp_lte: $endTime }
     ) {
         id
         transaction {
@@ -162,13 +162,13 @@ query getSwaps($poolId: String!, $first: Int!, $skip: Int!, $startTime: BigInt!)
 """
 
 MINTS_QUERY = """
-query getMints($first: Int!, $skip: Int!, $startTime: BigInt!, $minAmount: BigDecimal!) {
+query getMints($first: Int!, $skip: Int!, $startTime: BigInt!, $endTime: BigInt!, $minAmount: BigDecimal!) {
     mints(
         first: $first
         skip: $skip
         orderBy: timestamp
         orderDirection: desc
-        where: { timestamp_gte: $startTime, amountUSD_gte: $minAmount }
+        where: { timestamp_gte: $startTime, timestamp_lte: $endTime, amountUSD_gte: $minAmount }
     ) {
         id
         transaction {
@@ -198,13 +198,13 @@ query getMints($first: Int!, $skip: Int!, $startTime: BigInt!, $minAmount: BigDe
 """
 
 BURNS_QUERY = """
-query getBurns($first: Int!, $skip: Int!, $startTime: BigInt!, $minAmount: BigDecimal!) {
+query getBurns($first: Int!, $skip: Int!, $startTime: BigInt!, $endTime: BigInt!, $minAmount: BigDecimal!) {
     burns(
         first: $first
         skip: $skip
         orderBy: timestamp
         orderDirection: desc
-        where: { timestamp_gte: $startTime, amountUSD_gte: $minAmount }
+        where: { timestamp_gte: $startTime, timestamp_lte: $endTime, amountUSD_gte: $minAmount }
     ) {
         id
         transaction {

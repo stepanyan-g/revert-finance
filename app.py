@@ -777,7 +777,7 @@ elif page == "📥 Загрузка данных":
             st.success("✅ Загрузка завершена!")
             
             # Show results
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             
             with col1:
                 st.markdown("**Пулы:**")
@@ -798,6 +798,14 @@ elif page == "📥 Загрузка данных":
                     else:
                         st.write(f"• {key}: {data}")
                 st.write(f"**Итого: {total_pos}**")
+            
+            with col3:
+                st.markdown("**Свопы:**")
+                total_swaps = 0
+                for key, count in results.get("swaps", {}).items():
+                    st.write(f"• {key}: {count}")
+                    total_swaps += count
+                st.write(f"**Итого: {total_swaps}**")
             
             if results["errors"]:
                 with st.expander("⚠️ Ошибки при загрузке"):

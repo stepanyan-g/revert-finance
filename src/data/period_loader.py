@@ -391,37 +391,48 @@ class PeriodDataLoader:
         Returns:
             Dict with loading results
         """
+        from src.data.swaps import SwapLoader
+        
         results = {
             "pools": {},
             "positions": {},
+            "swaps": {},
             "errors": [],
         }
         
-        total_steps = len(periods) * len(networks) * 2  # pools + positions
+        # Pools are not period-dependent, so load once per network
+        pools_loaded_networks = set()
+        
+        # Calculate total steps: pools (once per network) + positions (per period+network) + swaps (per period+network)
+        total_steps = len(networks) + len(periods) * len(networks) * 2  # pools + positions + swaps
         current_step = 0
+        
+        # First, load pools for each network (only once per network, not per period)
+        for network in networks:
+            try:
+                if progress_callback:
+                    progress_callback(
+                        current_step / total_steps,
+                        f"Загрузка пулов: {network}"
+                    )
+                
+                pool_count = self.pool_loader.load_pools_for_network(
+                    session, network, min_tvl=min_tvl_usd, limit=limit_per_period * len(periods)
+                )
+                
+                results["pools"][network] = pool_count
+                pools_loaded_networks.add(network)
+                
+            except Exception as e:
+                results["errors"].append(f"Pools {network}: {e}")
+            
+            current_step += 1
+        
+        # Then load positions and swaps for each period
+        swap_loader = SwapLoader()
         
         for period in periods:
             for network in networks:
-                # Load pools
-                try:
-                    if progress_callback:
-                        progress_callback(
-                            current_step / total_steps,
-                            f"Загрузка пулов: {network} ({period.label})"
-                        )
-                    
-                    pool_count = self.pool_loader.load_pools_for_network(
-                        session, network, min_tvl=min_tvl_usd, limit=limit_per_period
-                    )
-                    
-                    key = f"{period.key}_{network}"
-                    results["pools"][key] = pool_count
-                    
-                except Exception as e:
-                    results["errors"].append(f"Pools {network} {period.key}: {e}")
-                
-                current_step += 1
-                
                 # Load positions for the period
                 try:
                     if progress_callback:
@@ -430,14 +441,13 @@ class PeriodDataLoader:
                             f"Загрузка позиций: {network} ({period.label})"
                         )
                     
-                    # Calculate hours from period start to end
-                    hours = int((period.end - period.start).total_seconds() / 3600)
-                    
+                    # Load positions for the specific period using start_date and end_date
                     pos_result = self.position_loader.load_positions_from_events(
                         session, network,
                         min_amount_usd=str(min_amount_usd),
                         limit=limit_per_period,
-                        hours=hours,
+                        start_date=period.start,
+                        end_date=period.end,
                     )
                     
                     key = f"{period.key}_{network}"
@@ -454,6 +464,33 @@ class PeriodDataLoader:
                     
                 except Exception as e:
                     results["errors"].append(f"Positions {network} {period.key}: {e}")
+                
+                current_step += 1
+                
+                # Load swaps for the period
+                try:
+                    if progress_callback:
+                        progress_callback(
+                            current_step / total_steps,
+                            f"Загрузка свопов: {network} ({period.label})"
+                        )
+                    
+                    # Load swaps for pools in this network
+                    # Calculate hours from period
+                    hours_in_period = int((period.end - period.start).total_seconds() / 3600)
+                    
+                    swap_result = swap_loader.load_swaps_for_period(
+                        session, network,
+                        start_date=period.start,
+                        end_date=period.end,
+                        limit=limit_per_period,
+                    )
+                    
+                    key = f"{period.key}_{network}"
+                    results["swaps"][key] = swap_result
+                    
+                except Exception as e:
+                    results["errors"].append(f"Swaps {network} {period.key}: {e}")
                 
                 current_step += 1
         

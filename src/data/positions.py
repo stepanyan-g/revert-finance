@@ -31,7 +31,9 @@ class PositionLoader:
         network: str,
         min_amount_usd: str = "100",
         limit: int = 200,
-        hours: int = 168,  # 7 days
+        hours: int = 168,  # 7 days (used if start_date not provided)
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
     ) -> Dict[str, int]:
         """
         Load positions by analyzing mint/burn events.
@@ -43,7 +45,9 @@ class PositionLoader:
             network: Network name
             min_amount_usd: Minimum USD value to consider
             limit: Maximum events to process
-            hours: How far back to look
+            hours: How far back to look (used if start_date not provided)
+            start_date: Start of period (optional, overrides hours)
+            end_date: End of period (optional)
             
         Returns:
             Dict with counts of open and closed positions
@@ -58,13 +62,22 @@ class PositionLoader:
             logger.warning(f"Failed to create client for {network}: {e}")
             return {"open": 0, "closed": 0}
         
-        start_time = int((datetime.utcnow() - timedelta(hours=hours)).timestamp())
+        # Determine time range
+        if start_date:
+            start_time = int(start_date.timestamp())
+        else:
+            start_time = int((datetime.utcnow() - timedelta(hours=hours)).timestamp())
+        
+        if end_date:
+            end_time = int(end_date.timestamp())
+        else:
+            end_time = int(datetime.utcnow().timestamp())
         
         # Track positions by (owner, pool, tick_range)
         positions_map: Dict[str, Dict] = {}
         
         # Load mints
-        mints = self._load_mints(client, start_time, min_amount_usd, limit)
+        mints = self._load_mints(client, start_time, end_time, min_amount_usd, limit)
         for mint in mints:
             key = self._position_key(mint)
             if key not in positions_map:
@@ -92,7 +105,7 @@ class PositionLoader:
             pos["deposited_usd"] += Decimal(str(mint.get("amountUSD", 0) or 0))
         
         # Load burns
-        burns = self._load_burns(client, start_time, min_amount_usd, limit)
+        burns = self._load_burns(client, start_time, end_time, min_amount_usd, limit)
         for burn in burns:
             key = self._position_key(burn)
             if key in positions_map:
@@ -131,6 +144,7 @@ class PositionLoader:
         self, 
         client: SubgraphClient, 
         start_time: int,
+        end_time: int,
         min_amount_usd: str,
         limit: int,
     ) -> List[dict]:
@@ -146,6 +160,7 @@ class PositionLoader:
                         "first": min(self.page_size, limit - len(mints)),
                         "skip": skip,
                         "startTime": str(start_time),
+                        "endTime": str(end_time),
                         "minAmount": min_amount_usd,
                     }
                 )
@@ -170,6 +185,7 @@ class PositionLoader:
         self, 
         client: SubgraphClient, 
         start_time: int,
+        end_time: int,
         min_amount_usd: str,
         limit: int,
     ) -> List[dict]:
@@ -185,6 +201,7 @@ class PositionLoader:
                         "first": min(self.page_size, limit - len(burns)),
                         "skip": skip,
                         "startTime": str(start_time),
+                        "endTime": str(end_time),
                         "minAmount": min_amount_usd,
                     }
                 )
