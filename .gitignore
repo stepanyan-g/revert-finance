@@ -11,8 +11,8 @@ venv/
 ENV/
 
 # Database
-*.db
-/data/
+# *.db
+# /data/
 
 # IDE
 .idea/
