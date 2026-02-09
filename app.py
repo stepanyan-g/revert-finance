@@ -565,13 +565,16 @@ if page == "🏠 Главная":
 elif page == "📥 Загрузка данных":
     st.title("📥 Загрузка данных")
     
+    # Import period loader
+    from src.data.period_loader import (
+        PeriodDataLoader, get_period_options, get_multi_period_options
+    )
+    
     st.info("""
     **Как это работает:**
-    - Данные загружаются из The Graph (децентрализованный индексер блокчейнов)
-    - Всё сохраняется в локальную базу данных (SQLite)
-    - При следующем запуске данные уже есть — нужно только обновить
-    
-    **Рекомендация:** Нажмите «🚀 Загрузить всё» для первичной загрузки
+    - Выберите период (месяц или несколько месяцев) для загрузки
+    - Таблица показывает сколько данных доступно и сколько уже загружено
+    - Данные загружаются инкрементально (новые добавляются, существующие не дублируются)
     """)
     
     # Current stats
@@ -586,81 +589,237 @@ elif page == "📥 Загрузка данных":
     
     st.markdown("---")
     
-    # Load all button
-    st.markdown("### 🚀 Загрузить всё (рекомендуется)")
-    
-    st.markdown("""
-    Эта кнопка загрузит:
-    1. **Пулы** — ликвидные пулы с выбранных сетей
-    2. **Свопы** — последние сделки для анализа потоков
-    3. **Позиции** — LP-позиции для анализа владельцев
-    """)
+    # =============================================================================
+    # Filters
+    # =============================================================================
+    st.markdown("### ⚙️ Параметры загрузки")
     
     available_networks = [n for n, c in NETWORKS.items() if c.enabled]
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        selected_networks = st.multiselect(
-            "Сети для загрузки",
-            available_networks,
-            default=["arbitrum", "ethereum"] if "arbitrum" in available_networks else available_networks[:2],
-            help="Выберите сети. Arbitrum и Ethereum — основные."
+        # Period selection
+        period_options = get_multi_period_options()
+        period_labels = [label for label, _ in period_options]
+        
+        selected_period_label = st.selectbox(
+            "📅 Период",
+            period_labels,
+            index=0,
+            help="Выберите период для загрузки данных"
         )
+        
+        # Get the actual periods for selected label
+        selected_periods = None
+        for label, periods in period_options:
+            if label == selected_period_label:
+                selected_periods = periods
+                break
     
     with col2:
+        selected_networks = st.multiselect(
+            "🌐 Сети",
+            available_networks,
+            default=["arbitrum", "ethereum"] if "arbitrum" in available_networks else available_networks[:2],
+            help="Выберите сети для загрузки"
+        )
+    
+    with col3:
         min_tvl = st.number_input(
-            "Мин. TVL пула ($)",
+            "💰 Мин. TVL пула ($)",
             min_value=10000,
             value=100000,
             step=10000,
             help="Пулы с TVL меньше этого значения не загружаются"
         )
     
-    with col3:
-        positions_limit = st.number_input(
-            "Лимит позиций на сеть",
-            min_value=50,
-            value=200,
+    col1, col2 = st.columns(2)
+    with col1:
+        min_amount = st.number_input(
+            "💵 Мин. сумма позиции ($)",
+            min_value=10,
+            value=100,
             step=50,
-            help="Сколько позиций загружать с каждой сети (больше = дольше)"
+            help="Позиции меньше этой суммы не загружаются"
+        )
+    with col2:
+        limit_per_period = st.number_input(
+            "📊 Лимит на период",
+            min_value=100,
+            value=500,
+            step=100,
+            help="Максимум записей за один период"
         )
     
-    if st.button("🚀 Загрузить всё", type="primary", use_container_width=True):
+    st.markdown("---")
+    
+    # =============================================================================
+    # Statistics Table
+    # =============================================================================
+    st.markdown("### 📈 Статистика загрузки")
+    
+    if selected_periods and selected_networks:
+        # Show loading statistics
+        if st.button("🔄 Обновить статистику", key="refresh_stats"):
+            with st.spinner("Получение статистики..."):
+                with session_scope() as session:
+                    loader = PeriodDataLoader()
+                    loader.refresh_statistics(
+                        session, selected_networks, min_tvl, min_amount
+                    )
+            st.rerun()
+        
+        with session_scope() as session:
+            loader = PeriodDataLoader()
+            
+            # Get stats for positions
+            position_stats = loader.get_period_statistics(
+                session, selected_periods, selected_networks,
+                min_tvl_usd=min_tvl,
+                min_amount_usd=min_amount,
+                data_type="positions"
+            )
+            
+            # Get stats for pools
+            pool_stats = loader.get_period_statistics(
+                session, selected_periods, selected_networks,
+                min_tvl_usd=min_tvl,
+                min_amount_usd=min_amount,
+                data_type="pools"
+            )
+        
+        # Create DataFrame for display
+        if position_stats:
+            st.markdown("#### 📍 Позиции")
+            
+            pos_data = []
+            for s in position_stats:
+                status_icon = "✅" if s.is_fully_loaded else ("🔶" if s.loaded_percent > 0 else "⬜")
+                pos_data.append({
+                    "Статус": status_icon,
+                    "Период": s.period_label,
+                    "Сеть": s.network,
+                    "В блокчейне": s.total_available,
+                    "Загружено": s.total_loaded,
+                    "Прогресс": f"{s.loaded_percent:.0f}%",
+                })
+            
+            pos_df = pd.DataFrame(pos_data)
+            st.dataframe(pos_df, use_container_width=True, hide_index=True)
+            
+            # Summary
+            total_available = sum(s.total_available for s in position_stats)
+            total_loaded = sum(s.total_loaded for s in position_stats)
+            overall_percent = (total_loaded / total_available * 100) if total_available > 0 else 0
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Всего в блокчейне", f"{total_available:,}")
+            col2.metric("Загружено", f"{total_loaded:,}")
+            col3.metric("Общий прогресс", f"{overall_percent:.1f}%")
+        
+        if pool_stats:
+            st.markdown("#### 🏊 Пулы")
+            
+            pool_data = []
+            for s in pool_stats:
+                status_icon = "✅" if s.is_fully_loaded else ("🔶" if s.loaded_percent > 0 else "⬜")
+                pool_data.append({
+                    "Статус": status_icon,
+                    "Сеть": s.network,
+                    "В блокчейне": s.total_available,
+                    "Загружено": s.total_loaded,
+                    "Прогресс": f"{s.loaded_percent:.0f}%",
+                })
+            
+            pool_df = pd.DataFrame(pool_data)
+            st.dataframe(pool_df, use_container_width=True, hide_index=True)
+    else:
+        st.warning("Выберите период и хотя бы одну сеть для просмотра статистики")
+    
+    st.markdown("---")
+    
+    # =============================================================================
+    # Load Data Button
+    # =============================================================================
+    st.markdown("### 🚀 Загрузка данных")
+    
+    if st.button("🚀 Загрузить данные за выбранный период", type="primary", use_container_width=True):
         if not selected_networks:
             st.error("Выберите хотя бы одну сеть")
         elif not GRAPH_API_KEY:
             st.error("GRAPH_API_KEY не настроен. Добавьте его в файл .env")
+        elif not selected_periods:
+            st.error("Выберите период")
         else:
-            results = load_all_data_action(selected_networks, min_tvl, positions_limit)
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            def update_progress(percent, message):
+                progress_bar.progress(percent)
+                status_text.text(message)
+            
+            with session_scope() as session:
+                loader = PeriodDataLoader()
+                results = loader.load_period_data(
+                    session,
+                    selected_periods,
+                    selected_networks,
+                    min_tvl_usd=min_tvl,
+                    min_amount_usd=min_amount,
+                    limit_per_period=limit_per_period,
+                    progress_callback=update_progress,
+                )
+            
+            # Calculate positions USD
+            calculate_positions_usd()
             
             st.success("✅ Загрузка завершена!")
             
-            col1, col2, col3 = st.columns(3)
+            # Show results
+            col1, col2 = st.columns(2)
+            
             with col1:
                 st.markdown("**Пулы:**")
-                for net, count in results["pools"].items():
-                    st.write(f"• {net}: {count}")
+                total_pools = 0
+                for key, count in results["pools"].items():
+                    st.write(f"• {key}: {count}")
+                    total_pools += count
+                st.write(f"**Итого: {total_pools}**")
+            
             with col2:
-                st.markdown("**Свопы:**")
-                st.write(f"• Загружено: {results['swaps']}")
-            with col3:
                 st.markdown("**Позиции:**")
-                for net, data in results["positions"].items():
+                total_pos = 0
+                for key, data in results["positions"].items():
                     if isinstance(data, dict):
-                        st.write(f"• {net}: {data.get('open', 0)} откр. + {data.get('closed', 0)} закр.")
+                        count = data.get('open', 0) + data.get('closed', 0)
+                        st.write(f"• {key}: {count} (откр: {data.get('open', 0)}, закр: {data.get('closed', 0)})")
+                        total_pos += count
                     else:
-                        st.write(f"• {net}: {data}")
+                        st.write(f"• {key}: {data}")
+                st.write(f"**Итого: {total_pos}**")
+            
+            if results["errors"]:
+                with st.expander("⚠️ Ошибки при загрузке"):
+                    for err in results["errors"]:
+                        st.write(f"• {err}")
+            
+            st.rerun()
     
-    st.markdown("---")
-    
-    # Manual loading options
+    # =============================================================================
+    # Manual loading (legacy)
+    # =============================================================================
     with st.expander("⚙️ Ручная загрузка (для продвинутых)"):
-        tab1, tab2, tab3 = st.tabs(["Пулы", "Свопы", "Позиции"])
+        st.markdown("""
+        **Примечание:** Рекомендуется использовать загрузку по периодам выше.
+        Эти опции сохранены для обратной совместимости.
+        """)
+        
+        tab1, tab2 = st.tabs(["Пулы", "Позиции"])
         
         with tab1:
             st.markdown("Загрузить только пулы:")
-            if st.button("Загрузить пулы"):
+            if st.button("Загрузить пулы", key="manual_load_pools"):
                 loader = PoolLoader()
                 with st.spinner("Загрузка пулов..."):
                     with session_scope() as session:
@@ -669,29 +828,13 @@ elif page == "📥 Загрузка данных":
                 st.success("Пулы загружены!")
         
         with tab2:
-            st.markdown("Загрузить только свопы:")
-            if st.button("Загрузить свопы"):
-                with st.spinner("Загрузка свопов..."):
-                    with session_scope() as session:
-                        pools = session.query(Pool).filter(
-                            Pool.tvl_usd >= min_tvl
-                        ).order_by(Pool.tvl_usd.desc()).limit(30).all()
-                        loader = SwapLoader()
-                        for pool in pools:
-                            try:
-                                loader.load_swaps_for_pool(session, pool, limit=50)
-                            except:
-                                pass
-                st.success("Свопы загружены!")
-        
-        with tab3:
             st.markdown("Загрузить только позиции:")
-            if st.button("Загрузить позиции"):
-                loader = PositionLoader()
+            if st.button("Загрузить позиции", key="manual_load_positions"):
+                pos_loader = PositionLoader()
                 with st.spinner("Загрузка позиций..."):
-                    results = loader.load_all_positions(
+                    results = pos_loader.load_all_positions(
                         networks=selected_networks,
-                        limit_per_network=positions_limit
+                        limit_per_network=limit_per_period
                     )
                     calculate_positions_usd()
                 st.success(f"Позиции загружены: {results}")

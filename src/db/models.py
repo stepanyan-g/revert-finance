@@ -497,3 +497,55 @@ class Signal(Base):
     __table_args__ = (
         Index("ix_signal_type_time", "signal_type", "created_at"),
     )
+
+
+# =============================================================================
+# Loading Statistics Model
+# =============================================================================
+
+class LoadingStats(Base):
+    """
+    Tracks data loading statistics per period and filter combination.
+    
+    Used to show how much data is loaded vs available for each time period.
+    """
+    __tablename__ = "loading_stats"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # Period identification
+    period_key = Column(String(20), nullable=False, index=True)  # e.g., "2024-01", "2024-02"
+    period_start = Column(DateTime, nullable=False)
+    period_end = Column(DateTime, nullable=False)
+    
+    # Network
+    network = Column(String(50), nullable=False, index=True)
+    
+    # Data type
+    data_type = Column(String(20), nullable=False)  # "positions", "pools"
+    
+    # Filter parameters (to track different filter combinations)
+    min_tvl_usd = Column(Numeric(30, 2), nullable=True)
+    min_amount_usd = Column(Numeric(30, 2), nullable=True)
+    
+    # Statistics from The Graph (total available)
+    total_available = Column(Integer, default=0)
+    
+    # Statistics in our database
+    total_loaded = Column(Integer, default=0)
+    
+    # Loading status
+    last_loaded_at = Column(DateTime, nullable=True)
+    is_fully_loaded = Column(Boolean, default=False)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        UniqueConstraint(
+            "period_key", "network", "data_type", "min_tvl_usd", "min_amount_usd",
+            name="uix_loading_stats_period_network_type_filters"
+        ),
+        Index("ix_loading_stats_period", "period_key"),
+    )
