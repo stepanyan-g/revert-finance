@@ -7,7 +7,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
 
 from .models import Base
@@ -18,6 +18,20 @@ _engine = None
 _SessionLocal = None
 
 
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    """Set SQLite pragmas for better performance and concurrency."""
+    cursor = dbapi_connection.cursor()
+    # WAL mode allows concurrent reads while writing
+    cursor.execute("PRAGMA journal_mode=WAL")
+    # Faster synchronous mode (still safe with WAL)
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    # Use memory for temp tables
+    cursor.execute("PRAGMA temp_store=MEMORY")
+    # Increase cache size (negative = KB, so -64000 = 64MB)
+    cursor.execute("PRAGMA cache_size=-64000")
+    cursor.close()
+
+
 def get_engine():
     """Get or create SQLAlchemy engine."""
     global _engine
@@ -25,18 +39,33 @@ def get_engine():
         settings = get_settings()
         
         # Ensure data directory exists for SQLite
-        if settings.database.url.startswith("sqlite"):
+        is_sqlite = settings.database.url.startswith("sqlite")
+        if is_sqlite:
             db_path = settings.database.url.replace("sqlite:///", "")
             if db_path.startswith("./"):
                 db_path = db_path[2:]
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         
+        # SQLite-specific connection args
+        connect_args = {}
+        if is_sqlite:
+            connect_args = {
+                "check_same_thread": False,
+                "timeout": 30,  # Wait up to 30 seconds for lock
+            }
+        
         _engine = create_engine(
             settings.database.url,
             echo=settings.database.echo,
-            # SQLite specific settings
-            connect_args={"check_same_thread": False} if "sqlite" in settings.database.url else {},
+            connect_args=connect_args,
+            # Pool settings for SQLite
+            pool_pre_ping=True,  # Check connection validity before use
         )
+        
+        # Set SQLite pragmas on connect
+        if is_sqlite:
+            event.listen(_engine, "connect", _set_sqlite_pragma)
+    
     return _engine
 
 
@@ -76,6 +105,7 @@ def session_scope() -> Generator[Session, None, None]:
         session.rollback()
         raise
     finally:
+        # Always close session to release locks
         session.close()
 
 
@@ -110,3 +140,18 @@ def reset_db() -> None:
     drop_all_tables()
     init_db()
     print("Database reset complete.")
+
+
+def close_all_connections() -> None:
+    """
+    Close all database connections and release locks.
+    
+    Useful when you get "database is locked" errors.
+    """
+    global _engine, _SessionLocal
+    
+    if _engine is not None:
+        _engine.dispose()
+        _engine = None
+        _SessionLocal = None
+        print("All database connections closed.")
