@@ -55,29 +55,47 @@ class SwapLoader:
             logger.warning(f"Failed to create client for {pool.network}: {e}")
             return 0
         
+        # Verify pool address format
+        if not pool.address or len(pool.address) != 42:
+            logger.error(f"Invalid pool address format: {pool.address}")
+            return 0
+        
         start_time = int((datetime.utcnow() - timedelta(hours=hours)).timestamp())
         loaded_count = 0
         skip = 0
         
+        logger.info(f"Loading swaps for pool {pool.address} ({pool.network}) - period: {hours}h, start_time: {start_time}")
+        
         while loaded_count < limit:
             try:
+                variables = {
+                    "poolId": pool.address.lower(),  # Ensure lowercase
+                    "first": min(self.page_size, limit - loaded_count),
+                    "skip": skip,
+                    "startTime": str(start_time),
+                }
+                
+                logger.debug(f"Query variables: {variables}")
                 data = client.query(
                     SWAPS_QUERY,
-                    variables={
-                        "poolId": pool.address,
-                        "first": min(self.page_size, limit - loaded_count),
-                        "skip": skip,
-                        "startTime": str(start_time),
-                    }
+                    variables=variables
                 )
                 
                 swaps = data.get("swaps", [])
+                logger.info(f"Received {len(swaps)} swaps from The Graph for pool {pool.address}")
+                
                 if not swaps:
+                    if skip == 0:
+                        logger.warning(f"No swaps found for pool {pool.address} in the last {hours} hours")
                     break
                 
                 for swap_data in swaps:
-                    self._save_swap(session, pool, swap_data)
-                    loaded_count += 1
+                    try:
+                        self._save_swap(session, pool, swap_data)
+                        loaded_count += 1
+                    except Exception as e:
+                        logger.error(f"Error saving swap {swap_data.get('id', 'unknown')}: {e}")
+                        continue
                 
                 session.commit()
                 skip += len(swaps)
@@ -86,9 +104,10 @@ class SwapLoader:
                     break
                     
             except Exception as e:
-                logger.error(f"Error loading swaps for pool {pool.address}: {e}")
+                logger.error(f"Error loading swaps for pool {pool.address}: {e}", exc_info=True)
                 break
         
+        logger.info(f"Loaded {loaded_count} swaps for pool {pool.address}")
         return loaded_count
     
     def _save_swap(self, session: Session, pool: Pool, data: dict) -> Swap:

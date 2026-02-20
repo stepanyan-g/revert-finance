@@ -497,3 +497,39 @@ class Signal(Base):
     __table_args__ = (
         Index("ix_signal_type_time", "signal_type", "created_at"),
     )
+
+
+# =============================================================================
+# Period Statistics Model
+# =============================================================================
+
+class PeriodStatistics(Base):
+    """Statistics by time period for networks."""
+    __tablename__ = "period_statistics"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # Network
+    network = Column(String(50), nullable=False, index=True)
+    
+    # Period name
+    period_name = Column(String(50), nullable=False, index=True)
+    # Values: "Последняя неделя", "Последний месяц", etc.
+    
+    # Statistics type
+    stat_type = Column(String(20), nullable=False, index=True)
+    # Values: "positions", "swaps", "owners"
+    
+    # Count
+    count = Column(Integer, nullable=False, default=0)
+    
+    # Filter used (min_tvl)
+    min_tvl = Column(Numeric(20, 2), nullable=False)
+    
+    # Timestamp when this was calculated
+    calculated_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    __table_args__ = (
+        UniqueConstraint("network", "period_name", "stat_type", "min_tvl", name="uix_period_stats_network_period_type_tvl"),
+        Index("ix_period_stats_calculated", "calculated_at"),
+    )

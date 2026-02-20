@@ -14,8 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
 import pandas as pd
+import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
+
+logger = logging.getLogger(__name__)
 
 # Import project modules
 from config.networks import NETWORKS, GRAPH_API_KEY
@@ -70,6 +73,481 @@ def get_pool_stats() -> dict:
             "total_positions": total_positions,
             "total_owners": total_owners,
             "pools_by_network": pools_by_network,
+        }
+
+
+def get_network_stats_table() -> pd.DataFrame:
+    """Get statistics by network for all entity types."""
+    with session_scope() as session:
+        from sqlalchemy import func, distinct
+        
+        # Get all networks that have any data
+        all_networks = set()
+        
+        # Pools by network
+        pools_by_network = dict(
+            session.query(Pool.network, func.count(Pool.id))
+            .group_by(Pool.network)
+            .all()
+        )
+        all_networks.update(pools_by_network.keys())
+        
+        # Swaps by network
+        swaps_by_network = dict(
+            session.query(Swap.network, func.count(Swap.id))
+            .group_by(Swap.network)
+            .all()
+        )
+        all_networks.update(swaps_by_network.keys())
+        
+        # Positions by network
+        positions_by_network = dict(
+            session.query(Position.network, func.count(Position.id))
+            .group_by(Position.network)
+            .all()
+        )
+        all_networks.update(positions_by_network.keys())
+        
+        # Owners by network (count distinct owner addresses per network from positions)
+        owners_by_network = dict(
+            session.query(Position.network, func.count(distinct(Position.owner_address)))
+            .filter(Position.owner_address != None)
+            .group_by(Position.network)
+            .all()
+        )
+        all_networks.update(owners_by_network.keys())
+        
+        # Build table data
+        data = []
+        for network in sorted(all_networks):
+            data.append({
+                "Сеть": network,
+                "Пулы": pools_by_network.get(network, 0),
+                "Свопы": swaps_by_network.get(network, 0),
+                "Позиции": positions_by_network.get(network, 0),
+                "Владельцы": owners_by_network.get(network, 0),
+            })
+        
+        # Add totals row
+        if data:
+            data.append({
+                "Сеть": "ИТОГО",
+                "Пулы": sum(d["Пулы"] for d in data),
+                "Свопы": sum(d["Свопы"] for d in data),
+                "Позиции": sum(d["Позиции"] for d in data),
+                "Владельцы": session.query(Owner).count(),  # Total unique owners
+            })
+        
+        return pd.DataFrame(data)
+
+
+def save_period_stats_to_db(stats: dict, networks: list, min_tvl: float) -> None:
+    """Save period statistics to database."""
+    from src.db.models import PeriodStatistics
+    
+    with session_scope() as session:
+        # Delete old statistics for these networks and min_tvl
+        session.query(PeriodStatistics).filter(
+            PeriodStatistics.network.in_(networks),
+            PeriodStatistics.min_tvl == min_tvl
+        ).delete()
+        
+        # Save new statistics
+        for stat_type in ["positions", "swaps", "owners"]:
+            df = stats.get(stat_type, pd.DataFrame())
+            if df.empty:
+                continue
+            
+            for _, row in df.iterrows():
+                network = row["Сеть"]
+                if network == "ИТОГО":
+                    continue
+                
+                for period_name in df.columns:
+                    if period_name == "Сеть":
+                        continue
+                    
+                    count = int(row.get(period_name, 0))
+                    stat = PeriodStatistics(
+                        network=network,
+                        period_name=period_name,
+                        stat_type=stat_type,
+                        count=count,
+                        min_tvl=min_tvl
+                    )
+                    session.add(stat)
+        
+        session.commit()
+        logger.info(f"Saved period statistics for networks {networks} with min_tvl={min_tvl}")
+
+
+def load_period_stats_from_db(networks: list, min_tvl: float) -> dict:
+    """Load period statistics from database."""
+    from src.db.models import PeriodStatistics
+    
+    periods = [
+        "Последняя неделя",
+        "Последний месяц",
+        "Последние 3 месяца",
+        "Последние 4 месяца",
+        "Последние 6 месяцев",
+        "Последний год",
+        "Последние 2 года",
+    ]
+    
+    with session_scope() as session:
+        stats = session.query(PeriodStatistics).filter(
+            PeriodStatistics.network.in_(networks),
+            PeriodStatistics.min_tvl == min_tvl
+        ).all()
+        
+        if not stats:
+            return None
+        
+        # Build data structures
+        positions_data = {net: {p: 0 for p in periods} for net in networks}
+        swaps_data = {net: {p: 0 for p in periods} for net in networks}
+        owners_data = {net: {p: 0 for p in periods} for net in networks}
+        
+        for stat in stats:
+            if stat.stat_type == "positions":
+                positions_data[stat.network][stat.period_name] = stat.count
+            elif stat.stat_type == "swaps":
+                swaps_data[stat.network][stat.period_name] = stat.count
+            elif stat.stat_type == "owners":
+                owners_data[stat.network][stat.period_name] = stat.count
+        
+        # Build DataFrames
+        positions_rows = []
+        swaps_rows = []
+        owners_rows = []
+        
+        for network in networks:
+            positions_rows.append({"Сеть": network, **positions_data[network]})
+            swaps_rows.append({"Сеть": network, **swaps_data[network]})
+            owners_rows.append({"Сеть": network, **owners_data[network]})
+        
+        # Add totals
+        totals_pos = {"Сеть": "ИТОГО"}
+        totals_swaps = {"Сеть": "ИТОГО"}
+        totals_owners = {"Сеть": "ИТОГО"}
+        
+        for period_name in periods:
+            totals_pos[period_name] = sum(r.get(period_name, 0) for r in positions_rows)
+            totals_swaps[period_name] = sum(r.get(period_name, 0) for r in swaps_rows)
+            totals_owners[period_name] = sum(r.get(period_name, 0) for r in owners_rows)
+        
+        positions_rows.append(totals_pos)
+        swaps_rows.append(totals_swaps)
+        owners_rows.append(totals_owners)
+        
+        return {
+            "positions": pd.DataFrame(positions_rows),
+            "swaps": pd.DataFrame(swaps_rows),
+            "owners": pd.DataFrame(owners_rows),
+        }
+
+
+def fetch_period_stats_from_graph(networks: list, min_tvl: float = 50000, progress_callback=None) -> dict:
+    """Fetch period statistics by querying each pool individually from The Graph API."""
+    from datetime import datetime, timedelta
+    from src.data.subgraph import SubgraphClient
+    from src.db.models import Pool
+    
+    periods = [
+        ("Последняя неделя", 7),
+        ("Последний месяц", 30),
+        ("Последние 3 месяца", 90),
+        ("Последние 4 месяца", 120),
+        ("Последние 6 месяцев", 180),
+        ("Последний год", 365),
+        ("Последние 2 года", 730),
+    ]
+    
+    now = datetime.utcnow()
+    
+    # Get pools from database filtered by network and TVL
+    # Extract all needed data inside session context to avoid DetachedInstanceError
+    pool_data = []
+    with session_scope() as session:
+        pools = session.query(Pool).filter(
+            Pool.network.in_(networks),
+            Pool.tvl_usd >= min_tvl
+        ).order_by(Pool.tvl_usd.desc()).all()
+        
+        # Extract all needed attributes while session is active
+        for pool in pools:
+            pool_data.append({
+                "network": pool.network,
+                "address": pool.address.lower(),
+                "token0_symbol": pool.token0_symbol or "",
+                "token1_symbol": pool.token1_symbol or "",
+            })
+    
+    if not pool_data:
+        logger.warning(f"No pools found for networks {networks} with TVL >= {min_tvl}")
+        # Return empty dataframes
+        periods_names = [p[0] for p in periods]
+        empty_df = pd.DataFrame([{"Сеть": "Нет данных"}] + [{col: 0 for col in periods_names}])
+        return {
+            "positions": empty_df,
+            "swaps": empty_df,
+            "owners": empty_df,
+        }
+    
+    # Initialize data structures per network
+    network_positions = {net: {p[0]: 0 for p in periods} for net in networks}
+    network_swaps = {net: {p[0]: 0 for p in periods} for net in networks}
+    network_owners = {net: {p[0]: set() for p in periods} for net in networks}
+    
+    total_pools = len(pool_data)
+    current_pool = 0
+    
+    # Group pools by network
+    pools_by_network = {}
+    for pool_info in pool_data:
+        network = pool_info["network"]
+        if network not in pools_by_network:
+            pools_by_network[network] = []
+        pools_by_network[network].append(pool_info)
+    
+    # Query each pool for each period
+    for network, network_pools in pools_by_network.items():
+        try:
+            client = SubgraphClient(network)
+        except ValueError as e:
+            logger.error(f"Failed to create client for {network}: {e}")
+            continue
+        
+        network_pool_count = len(network_pools)
+        network_pool_index = 0
+        
+        for pool_info in network_pools:
+            current_pool += 1
+            network_pool_index += 1
+            pool_address = pool_info["address"]
+            
+            if progress_callback:
+                progress_callback(
+                    current_pool / total_pools,
+                    f"{network}: {pool_info['token0_symbol']}/{pool_info['token1_symbol']} ({current_pool}/{total_pools} пулов)"
+                )
+            
+            for period_name, days in periods:
+                cutoff = now - timedelta(days=days)
+                start_time = int(cutoff.timestamp())
+                
+                # Query mints (positions) for this pool
+                try:
+                    mints_query = """
+                    query getPoolMints($poolId: String!, $startTime: BigInt!, $first: Int!) {
+                        mints(
+                            first: $first
+                            where: { pool: $poolId, timestamp_gte: $startTime }
+                            orderBy: timestamp
+                            orderDirection: desc
+                        ) {
+                            id
+                            owner
+                        }
+                    }
+                    """
+                    result = client.query(mints_query, {
+                        "poolId": pool_address,
+                        "startTime": str(start_time),
+                        "first": 1000
+                    })
+                    mints = result.get("mints", [])
+                    network_positions[network][period_name] += len(mints)
+                    for m in mints:
+                        if m.get("owner"):
+                            network_owners[network][period_name].add(m["owner"].lower())
+                except Exception as e:
+                    logger.debug(f"Error fetching mints for pool {pool_address}/{period_name}: {e}")
+                
+                # Query swaps for this pool
+                try:
+                    swaps_query = """
+                    query getPoolSwaps($poolId: String!, $startTime: BigInt!, $first: Int!) {
+                        swaps(
+                            first: $first
+                            where: { pool: $poolId, timestamp_gte: $startTime }
+                            orderBy: timestamp
+                            orderDirection: desc
+                        ) {
+                            id
+                        }
+                    }
+                    """
+                    result = client.query(swaps_query, {
+                        "poolId": pool_address,
+                        "startTime": str(start_time),
+                        "first": 1000
+                    })
+                    swaps = result.get("swaps", [])
+                    network_swaps[network][period_name] += len(swaps)
+                except Exception as e:
+                    logger.debug(f"Error fetching swaps for pool {pool_address}/{period_name}: {e}")
+    
+    # Build result dataframes
+    positions_data = []
+    swaps_data = []
+    owners_data = []
+    
+    for network in networks:
+        positions_row = {"Сеть": network}
+        swaps_row = {"Сеть": network}
+        owners_row = {"Сеть": network}
+        
+        for period_name, _ in periods:
+            positions_row[period_name] = network_positions[network].get(period_name, 0)
+            swaps_row[period_name] = network_swaps[network].get(period_name, 0)
+            owners_row[period_name] = len(network_owners[network].get(period_name, set()))
+        
+        positions_data.append(positions_row)
+        swaps_data.append(swaps_row)
+        owners_data.append(owners_row)
+    
+    # Add totals
+    if positions_data:
+        totals_pos = {"Сеть": "ИТОГО"}
+        totals_swaps = {"Сеть": "ИТОГО"}
+        totals_owners = {"Сеть": "ИТОГО"}
+        
+        # For owners, we need to merge sets across networks to avoid double counting
+        all_owners_by_period = {p[0]: set() for p in periods}
+        for network in networks:
+            for period_name, _ in periods:
+                all_owners_by_period[period_name].update(network_owners[network].get(period_name, set()))
+        
+        for period_name, _ in periods:
+            totals_pos[period_name] = sum(r.get(period_name, 0) for r in positions_data)
+            totals_swaps[period_name] = sum(r.get(period_name, 0) for r in swaps_data)
+            totals_owners[period_name] = len(all_owners_by_period[period_name])
+        
+        positions_data.append(totals_pos)
+        swaps_data.append(totals_swaps)
+        owners_data.append(totals_owners)
+    
+    result = {
+        "positions": pd.DataFrame(positions_data),
+        "swaps": pd.DataFrame(swaps_data),
+        "owners": pd.DataFrame(owners_data),
+    }
+    
+    # Save to database
+    try:
+        save_period_stats_to_db(result, networks, min_tvl)
+    except Exception as e:
+        logger.error(f"Error saving period statistics to DB: {e}", exc_info=True)
+    
+    return result
+
+
+def get_period_stats_table() -> dict:
+    """Get statistics by time period for Positions and Swaps."""
+    from datetime import datetime, timedelta
+    
+    periods = [
+        ("Последняя неделя", 7),
+        ("Последний месяц", 30),
+        ("Последние 3 месяца", 90),
+        ("Последние 4 месяца", 120),
+        ("Последние 6 месяцев", 180),
+        ("Последний год", 365),
+        ("Последние 2 года", 730),
+    ]
+    
+    with session_scope() as session:
+        from sqlalchemy import func, distinct
+        
+        now = datetime.utcnow()
+        
+        # Get all networks
+        all_networks = set()
+        for net, in session.query(Position.network).distinct().all():
+            all_networks.add(net)
+        for net, in session.query(Swap.network).distinct().all():
+            all_networks.add(net)
+        
+        # Build positions data
+        positions_data = []
+        for network in sorted(all_networks):
+            row = {"Сеть": network}
+            for period_name, days in periods:
+                cutoff = now - timedelta(days=days)
+                count = session.query(func.count(Position.id)).filter(
+                    Position.network == network,
+                    Position.created_at >= cutoff
+                ).scalar() or 0
+                row[period_name] = count
+            positions_data.append(row)
+        
+        # Add totals for positions
+        if positions_data:
+            totals_row = {"Сеть": "ИТОГО"}
+            for period_name, days in periods:
+                cutoff = now - timedelta(days=days)
+                total = session.query(func.count(Position.id)).filter(
+                    Position.created_at >= cutoff
+                ).scalar() or 0
+                totals_row[period_name] = total
+            positions_data.append(totals_row)
+        
+        # Build swaps data
+        swaps_data = []
+        for network in sorted(all_networks):
+            row = {"Сеть": network}
+            for period_name, days in periods:
+                cutoff = now - timedelta(days=days)
+                count = session.query(func.count(Swap.id)).filter(
+                    Swap.network == network,
+                    Swap.timestamp >= cutoff
+                ).scalar() or 0
+                row[period_name] = count
+            swaps_data.append(row)
+        
+        # Add totals for swaps
+        if swaps_data:
+            totals_row = {"Сеть": "ИТОГО"}
+            for period_name, days in periods:
+                cutoff = now - timedelta(days=days)
+                total = session.query(func.count(Swap.id)).filter(
+                    Swap.timestamp >= cutoff
+                ).scalar() or 0
+                totals_row[period_name] = total
+            swaps_data.append(totals_row)
+        
+        # Build owners data (unique owners who created positions in period)
+        owners_data = []
+        for network in sorted(all_networks):
+            row = {"Сеть": network}
+            for period_name, days in periods:
+                cutoff = now - timedelta(days=days)
+                count = session.query(func.count(distinct(Position.owner_address))).filter(
+                    Position.network == network,
+                    Position.created_at >= cutoff,
+                    Position.owner_address != None
+                ).scalar() or 0
+                row[period_name] = count
+            owners_data.append(row)
+        
+        # Add totals for owners
+        if owners_data:
+            totals_row = {"Сеть": "ИТОГО"}
+            for period_name, days in periods:
+                cutoff = now - timedelta(days=days)
+                total = session.query(func.count(distinct(Position.owner_address))).filter(
+                    Position.created_at >= cutoff,
+                    Position.owner_address != None
+                ).scalar() or 0
+                totals_row[period_name] = total
+            owners_data.append(totals_row)
+        
+        return {
+            "positions": pd.DataFrame(positions_data),
+            "swaps": pd.DataFrame(swaps_data),
+            "owners": pd.DataFrame(owners_data),
         }
 
 
@@ -140,7 +618,23 @@ def get_signals(limit: int = 20) -> pd.DataFrame:
         return pd.DataFrame(data)
 
 
-def load_all_data_action(networks: list, min_tvl: float, positions_limit: int):
+def get_period_hours(period_name: str) -> int:
+    """Convert period name to hours."""
+    periods = {
+        "Последняя неделя": 7 * 24,  # 168 hours
+        "Последний месяц": 30 * 24,  # 720 hours
+        "Последние 3 месяца": 90 * 24,  # 2160 hours
+        "Последние 4 месяца": 120 * 24,  # 2880 hours
+        "Последний год": 365 * 24,  # 8760 hours
+        "Последние 2 года": 730 * 24,  # 17520 hours
+        "Последние 3 года": 1095 * 24,  # 26280 hours
+        "Последние 4 года": 1460 * 24,  # 35040 hours
+        "Последние 5 лет": 1825 * 24,  # 43800 hours
+    }
+    return periods.get(period_name, 168)  # Default to 1 week
+
+
+def load_all_data_action(networks: list, min_tvl: float, positions_limit: int, hours: int = 168):
     """Загрузить все данные: пулы → свопы → позиции."""
     results = {
         "pools": {},
@@ -155,31 +649,220 @@ def load_all_data_action(networks: list, min_tvl: float, positions_limit: int):
     status.text("📊 Шаг 1/4: Загрузка пулов...")
     loader = PoolLoader()
     
+    total_loaded = 0
+    detailed_errors = []
+    
+    # Check GRAPH_API_KEY first
+    if not GRAPH_API_KEY:
+        status.error("❌ GRAPH_API_KEY не установлен!")
+        status.text("💡 Добавьте GRAPH_API_KEY в файл .env")
+        results["pools_error"] = "GRAPH_API_KEY не установлен"
+        return results
+    
     for i, network in enumerate(networks):
         try:
+            status.text(f"📊 Шаг 1/4: Загрузка пулов из {network}...")
+            
+            # Check if network is enabled
+            network_config = NETWORKS.get(network)
+            if not network_config:
+                error_msg = f"Сеть '{network}' не найдена в конфигурации"
+                results["pools"][network] = f"Ошибка: {error_msg}"
+                detailed_errors.append(f"{network}: {error_msg}")
+                logger.error(error_msg)
+                continue
+            
+            if not network_config.enabled:
+                error_msg = f"Сеть '{network}' отключена"
+                results["pools"][network] = f"Ошибка: {error_msg}"
+                detailed_errors.append(f"{network}: {error_msg}")
+                logger.error(error_msg)
+                continue
+            
+            # Check if subgraph is configured
+            if not network_config.subgraphs.uniswap_v3:
+                error_msg = f"Subgraph для {network} не настроен"
+                results["pools"][network] = f"Ошибка: {error_msg}"
+                detailed_errors.append(f"{network}: {error_msg}")
+                logger.error(error_msg)
+                continue
+            
             with session_scope() as session:
                 count = loader.load_pools_for_network(session, network, min_tvl=min_tvl)
                 results["pools"][network] = count
+                total_loaded += count
+                
+                if count > 0:
+                    status.text(f"📊 Шаг 1/4: Загружено {total_loaded} пулов... ({network}: {count})")
+                else:
+                    status.text(f"⚠️ Шаг 1/4: {network}: пулы не найдены (TVL >= ${min_tvl:,.0f})")
+                
+                # Ensure commit happens
+                session.commit()
+        except ValueError as e:
+            # This is usually GRAPH_API_KEY or subgraph configuration error
+            error_msg = str(e)
+            results["pools"][network] = f"Ошибка конфигурации: {error_msg[:50]}"
+            detailed_errors.append(f"{network}: {error_msg}")
+            logger.error(f"Configuration error for {network}: {e}", exc_info=True)
         except Exception as e:
-            results["pools"][network] = f"Ошибка: {str(e)[:30]}"
+            error_msg = str(e)[:100]
+            results["pools"][network] = f"Ошибка: {error_msg}"
+            detailed_errors.append(f"{network}: {error_msg}")
+            logger.error(f"Error loading pools from {network}: {e}", exc_info=True)
         progress.progress((i + 1) / len(networks) * 0.25)
     
-    # Шаг 2: Загрузка свопов
-    status.text("💱 Шаг 2/4: Загрузка свопов...")
+    # Store detailed errors
+    if detailed_errors:
+        results["pools_detailed_errors"] = detailed_errors
+    
+    # Verify pools were actually saved
     with session_scope() as session:
+        verify_count = session.query(Pool).filter(
+            Pool.network.in_(networks),
+            Pool.tvl_usd >= min_tvl
+        ).count()
+        if verify_count == 0 and total_loaded > 0:
+            status.warning(f"⚠️ Загружено {total_loaded} пулов, но они не найдены в базе. Возможно проблема с коммитом.")
+        elif verify_count > 0:
+            status.text(f"✅ Подтверждено: {verify_count} пулов в базе для выбранных сетей")
+    
+    if total_loaded == 0:
+        status.error("❌ Не удалось загрузить пулы!")
+        
+        # Show specific error messages
+        if detailed_errors:
+            status.text("Детали ошибок:")
+            for err in detailed_errors[:3]:
+                status.text(f"  • {err}")
+        
+        # Provide helpful suggestions
+        suggestions = []
+        if not GRAPH_API_KEY:
+            suggestions.append("1. Установите GRAPH_API_KEY в файле .env")
+        if detailed_errors:
+            if any("не найдена" in e for e in detailed_errors):
+                suggestions.append("2. Проверьте названия сетей (ethereum, arbitrum, polygon, etc.)")
+            if any("Subgraph" in e for e in detailed_errors):
+                suggestions.append("3. Проверьте конфигурацию subgraph в config/networks.py")
+            if any("TVL" in e for e in detailed_errors):
+                suggestions.append("4. Попробуйте уменьшить 'Мин. TVL пула'")
+        
+        if suggestions:
+            status.text("💡 Рекомендации:")
+            for suggestion in suggestions:
+                status.text(f"  {suggestion}")
+        
+        results["pools_error"] = True
+    
+    # Шаг 2: Загрузка свопов
+    status.text(f"💱 Шаг 2/4: Загрузка свопов (период: {hours // 24} дней)...")
+    
+    # Small delay to ensure Step 1 commits are visible
+    import time
+    time.sleep(0.5)
+    
+    with session_scope() as session:
+        # First check if any pools exist at all
+        total_pools = session.query(Pool).count()
+        pools_in_networks = session.query(Pool).filter(
+            Pool.network.in_(networks)
+        ).count()
+        pools_above_tvl = session.query(Pool).filter(
+            Pool.tvl_usd >= min_tvl,
+            Pool.network.in_(networks)
+        ).count()
+        
+        # Debug: Show what networks are in DB
+        all_networks_in_db = [n[0] for n in session.query(Pool.network).distinct().all()]
+        logger.info(f"Step 2: Total pools={total_pools}, In networks={pools_in_networks}, Above TVL={pools_above_tvl}")
+        logger.info(f"Step 2: Networks in DB: {all_networks_in_db}, Looking for: {networks}")
+        
         pools = session.query(Pool).filter(
             Pool.tvl_usd >= min_tvl,
             Pool.network.in_(networks)
         ).order_by(Pool.tvl_usd.desc()).limit(30).all()
         
-        swap_loader = SwapLoader()
-        for i, pool in enumerate(pools):
-            try:
-                count = swap_loader.load_swaps_for_pool(session, pool, limit=50)
-                results["swaps"] += count
-            except:
-                pass
-            progress.progress(0.25 + (i + 1) / len(pools) * 0.25)
+        if not pools:
+            # Provide detailed diagnostic information
+            if total_pools == 0:
+                status.error("❌ В базе данных нет пулов!")
+                status.text("💡 Решение: Убедитесь, что Шаг 1 (Загрузка пулов) выполнен успешно.")
+                results["swap_warning"] = "Пулы не загружены"
+                results["swap_diagnostic"] = {
+                    "total_pools": 0,
+                    "suggestion": "Загрузите пулы на Шаге 1"
+                }
+            elif pools_in_networks == 0:
+                status.warning(f"⚠️ В базе нет пулов для сетей: {', '.join(networks)}")
+                status.text(f"Всего пулов в базе: {total_pools}")
+                if all_networks_in_db:
+                    status.text(f"Доступные сети в базе: {', '.join(all_networks_in_db)}")
+                    status.text(f"💡 Возможно несоответствие названий сетей. Проверьте, что выбранные сети совпадают с загруженными.")
+                results["swap_warning"] = f"Нет пулов для сетей {', '.join(networks)}"
+                results["swap_diagnostic"] = {
+                    "total_pools": total_pools,
+                    "available_networks": all_networks_in_db,
+                    "requested_networks": networks,
+                    "suggestion": f"Выберите сети: {', '.join(all_networks_in_db)}" if all_networks_in_db else "Загрузите пулы для выбранных сетей"
+                }
+            elif pools_above_tvl == 0:
+                # Get TVL stats for pools in selected networks
+                tvl_stats = session.query(
+                    Pool.tvl_usd
+                ).filter(
+                    Pool.network.in_(networks)
+                ).order_by(Pool.tvl_usd.desc()).all()
+                
+                max_tvl_val = float(tvl_stats[0][0]) if tvl_stats and tvl_stats[0][0] else 0
+                min_tvl_val = float(tvl_stats[-1][0]) if tvl_stats and tvl_stats[-1][0] else 0
+                
+                status.warning(f"⚠️ Нет пулов с TVL >= ${min_tvl:,.0f}")
+                status.text(f"Пулов в выбранных сетях: {pools_in_networks}")
+                status.text(f"Максимальный TVL: ${max_tvl_val:,.0f}")
+                status.text(f"Минимальный TVL: ${min_tvl_val:,.0f}")
+                status.text(f"💡 Попробуйте уменьшить 'Мин. TVL пула' до ${max_tvl_val * 0.9:,.0f} или меньше")
+                
+                results["swap_warning"] = f"TVL фильтр слишком высокий"
+                results["swap_diagnostic"] = {
+                    "pools_in_networks": pools_in_networks,
+                    "max_tvl": max_tvl_val,
+                    "min_tvl": min_tvl_val,
+                    "requested_min_tvl": min_tvl,
+                    "suggestion": f"Уменьшите мин. TVL до ${max_tvl_val * 0.9:,.0f} или меньше"
+                }
+            else:
+                results["swap_warning"] = "Пулы не найдены"
+        else:
+            status.text(f"💱 Шаг 2/4: Загрузка свопов из {len(pools)} пулов...")
+            swap_loader = SwapLoader()
+            swap_errors = []
+            successful_pools = 0
+            pools_with_swaps = []
+            pools_without_swaps = []
+            
+            for i, pool in enumerate(pools):
+                try:
+                    count = swap_loader.load_swaps_for_pool(session, pool, hours=hours, limit=50)
+                    results["swaps"] += count
+                    if count > 0:
+                        successful_pools += 1
+                        pools_with_swaps.append(f"{pool.network}/{pool.token0_symbol}-{pool.token1_symbol} ({count})")
+                    else:
+                        pools_without_swaps.append(f"{pool.network}/{pool.token0_symbol}-{pool.token1_symbol}")
+                except Exception as e:
+                    error_msg = f"{pool.network}/{pool.token0_symbol}-{pool.token1_symbol}: {str(e)[:50]}"
+                    swap_errors.append(error_msg)
+                    logger.error(f"Error loading swaps for pool {pool.address}: {e}", exc_info=True)
+                progress.progress(0.25 + (i + 1) / len(pools) * 0.25)
+            
+            results["pools_with_swaps"] = pools_with_swaps
+            results["pools_without_swaps"] = pools_without_swaps
+            
+            if swap_errors:
+                results["swap_errors"] = swap_errors
+            results["successful_swap_pools"] = successful_pools
+            results["total_swap_pools"] = len(pools)
     
     # Шаг 3: Загрузка позиций (открытые + закрытые через mints/burns)
     status.text("📍 Шаг 3/4: Загрузка позиций через события mint/burn...")
@@ -190,7 +873,7 @@ def load_all_data_action(networks: list, min_tvl: float, positions_limit: int):
             with session_scope() as session:
                 # Загружает открытые И закрытые позиции через анализ mint/burn событий
                 result = pos_loader.load_positions_from_events(
-                    session, network, min_amount_usd="100", limit=positions_limit
+                    session, network, min_amount_usd="100", limit=positions_limit, hours=hours
                 )
                 results["positions"][network] = result
         except Exception as e:
@@ -440,14 +1123,22 @@ def get_watched_owners() -> list:
 # Sidebar (Русское меню)
 # =============================================================================
 
-st.sidebar.title("🔄 Revert LP Стратегия")
-st.sidebar.markdown("---")
+    st.sidebar.title("🔄 Revert LP Стратегия")
+    st.sidebar.markdown("---")
 
-# API Key status
-if GRAPH_API_KEY:
-    st.sidebar.success("✅ API ключ настроен")
-else:
-    st.sidebar.error("❌ GRAPH_API_KEY не установлен")
+    # API Key status
+    if GRAPH_API_KEY:
+        st.sidebar.success("✅ API ключ настроен")
+        # Test API key by trying to create a client
+        try:
+            from src.data.subgraph import SubgraphClient
+            test_client = SubgraphClient("ethereum")
+            st.sidebar.caption(f"🔗 Endpoint: {test_client.endpoint[:50]}...")
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ Проблема с API: {str(e)[:40]}")
+    else:
+        st.sidebar.error("❌ GRAPH_API_KEY не установлен")
+        st.sidebar.caption("Добавьте в .env файл")
 
 st.sidebar.markdown("---")
 
@@ -570,19 +1261,199 @@ elif page == "📥 Загрузка данных":
     - Данные загружаются из The Graph (децентрализованный индексер блокчейнов)
     - Всё сохраняется в локальную базу данных (SQLite)
     - При следующем запуске данные уже есть — нужно только обновить
+    - Дубликаты автоматически исключаются при подсчёте
     
     **Рекомендация:** Нажмите «🚀 Загрузить всё» для первичной загрузки
     """)
     
-    # Current stats
+    # Professional CSS styling
+    st.markdown("""
+    <style>
+    .stats-header {
+        background: linear-gradient(90deg, #1e3a5f 0%, #2d5a3d 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        margin-bottom: 1rem;
+    }
+    .stats-header h3 {
+        color: white;
+        margin: 0;
+    }
+    .metric-card {
+        background: #1a1a2e;
+        border: 1px solid #3a3a5e;
+        border-radius: 8px;
+        padding: 1rem;
+        text-align: center;
+    }
+    .section-divider {
+        border-top: 2px solid #3a3a5e;
+        margin: 2rem 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Summary metrics at top
     stats = get_pool_stats()
     
-    st.markdown("### 📊 Текущие данные в базе")
+    st.markdown("### 📊 Сводка данных")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Пулы", stats['total_pools'])
-    col2.metric("Свопы", stats['total_swaps'])
-    col3.metric("Позиции", stats['total_positions'])
-    col4.metric("Владельцы", stats['total_owners'])
+    col1.metric("🏊 Пулы", f"{stats['total_pools']:,}")
+    col2.metric("💱 Свопы", f"{stats['total_swaps']:,}")
+    col3.metric("📍 Позиции", f"{stats['total_positions']:,}")
+    col4.metric("👥 Владельцы", f"{stats['total_owners']:,}")
+    
+    st.markdown("---")
+    
+    # Network breakdown table
+    st.markdown("### 🌐 Данные по сетям")
+    
+    network_stats_df = get_network_stats_table()
+    
+    if network_stats_df.empty:
+        st.warning("⚠️ База данных пуста. Загрузите данные ниже.")
+    else:
+        def style_network_table(row):
+            if row["Сеть"] == "ИТОГО":
+                return ["background-color: #1e3a5f; font-weight: bold; color: white"] * len(row)
+            return [""] * len(row)
+        
+        styled_df = network_stats_df.style.apply(style_network_table, axis=1)
+        styled_df = styled_df.format({
+            "Пулы": "{:,}",
+            "Свопы": "{:,}",
+            "Позиции": "{:,}",
+            "Владельцы": "{:,}",
+        })
+        
+        st.dataframe(styled_df, use_container_width=True, hide_index=True, height=200)
+    
+    st.markdown("---")
+    
+    # Period statistics section
+    st.markdown("### 📅 Статистика по периодам")
+    st.caption("Реальные данные из The Graph для каждого временного периода")
+    
+    # Network selection for period stats
+    available_networks = [n for n, c in NETWORKS.items() if c.enabled]
+    
+    col_nets, col_tvl, col_btn = st.columns([2, 1, 1])
+    with col_nets:
+        period_networks = st.multiselect(
+            "Сети для статистики",
+            available_networks,
+            default=["ethereum", "arbitrum"] if "ethereum" in available_networks else available_networks[:2],
+            key="period_stats_networks"
+        )
+    with col_tvl:
+        period_min_tvl = st.number_input(
+            "Мин. TVL пула ($)",
+            min_value=10000,
+            value=100000,
+            step=10000,
+            key="period_stats_min_tvl",
+            help="Используются только пулы с TVL >= этого значения"
+        )
+    with col_btn:
+        refresh_periods = st.button("🔄 Загрузить статистику", type="primary", use_container_width=True)
+    
+    st.caption("⚡ Загружает актуальные данные напрямую из The Graph API по каждому пулу")
+    
+    # Fetch period stats from The Graph when button is clicked
+    if refresh_periods:
+        if not period_networks:
+            st.error("Выберите хотя бы одну сеть")
+        elif not GRAPH_API_KEY:
+            st.error("GRAPH_API_KEY не настроен")
+        else:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            def update_progress(progress, text):
+                progress_bar.progress(progress)
+                status_text.text(text)
+            
+            with st.spinner("Загрузка статистики из The Graph..."):
+                st.session_state.period_stats = fetch_period_stats_from_graph(
+                    period_networks,
+                    min_tvl=period_min_tvl,
+                    progress_callback=update_progress
+                )
+            
+            progress_bar.empty()
+            status_text.empty()
+            st.success("✅ Статистика загружена!")
+    
+    # Try to load from session state first, then from database
+    period_stats = st.session_state.get("period_stats", None)
+    
+    # If not in session state, try to load from database
+    if not period_stats and period_networks:
+        try:
+            period_stats = load_period_stats_from_db(period_networks, period_min_tvl)
+            if period_stats:
+                st.session_state.period_stats = period_stats
+                st.info("📊 Загружена сохранённая статистика из базы данных")
+        except Exception as e:
+            logger.debug(f"Could not load period stats from DB: {e}")
+    
+    # Always show the section, even if no data loaded yet
+    if period_stats:
+        # Helper function for styling period tables
+        def style_period_table(df):
+            def highlight_row(row):
+                if row["Сеть"] == "ИТОГО":
+                    return ["background-color: #1e3a5f; font-weight: bold; color: white"] * len(row)
+                return [""] * len(row)
+            
+            # Get numeric columns (all except "Сеть")
+            numeric_cols = [col for col in df.columns if col != "Сеть"]
+            format_dict = {col: "{:,}" for col in numeric_cols}
+            
+            return df.style.apply(highlight_row, axis=1).format(format_dict)
+        
+        # Positions by period
+        st.markdown("#### 📍 Позиции по периодам")
+        positions_df = period_stats.get("positions", pd.DataFrame())
+        if not positions_df.empty:
+            st.dataframe(
+                style_period_table(positions_df),
+                use_container_width=True,
+                hide_index=True,
+                height=200
+            )
+        else:
+            st.info("👆 Нажмите «Загрузить статистику» для получения данных")
+        
+        # Swaps by period
+        st.markdown("#### 💱 Свопы по периодам")
+        swaps_df = period_stats.get("swaps", pd.DataFrame())
+        if not swaps_df.empty:
+            st.dataframe(
+                style_period_table(swaps_df),
+                use_container_width=True,
+                hide_index=True,
+                height=200
+            )
+        else:
+            st.info("👆 Нажмите «Загрузить статистику» для получения данных")
+        
+        # Owners by period
+        st.markdown("#### 👥 Активные владельцы по периодам")
+        st.caption("Уникальные владельцы, создавшие позиции в каждом периоде")
+        owners_df = period_stats.get("owners", pd.DataFrame())
+        if not owners_df.empty:
+            st.dataframe(
+                style_period_table(owners_df),
+                use_container_width=True,
+                hide_index=True,
+                height=200
+            )
+        else:
+            st.info("👆 Нажмите «Загрузить статистику» для получения данных")
+    else:
+        # Show placeholder when no data loaded yet
+        st.info("👆 Выберите сети и нажмите «Загрузить статистику» для отображения данных по периодам")
     
     st.markdown("---")
     
@@ -592,13 +1463,26 @@ elif page == "📥 Загрузка данных":
     st.markdown("""
     Эта кнопка загрузит:
     1. **Пулы** — ликвидные пулы с выбранных сетей
-    2. **Свопы** — последние сделки для анализа потоков
-    3. **Позиции** — LP-позиции для анализа владельцев
+    2. **Свопы** — сделки за выбранный период для анализа потоков
+    3. **Позиции** — LP-позиции за выбранный период для анализа владельцев
     """)
     
     available_networks = [n for n, c in NETWORKS.items() if c.enabled]
     
-    col1, col2, col3 = st.columns(3)
+    # Define period options once for use in both main and manual loading
+    period_options = [
+        "Последняя неделя",
+        "Последний месяц",
+        "Последние 3 месяца",
+        "Последние 4 месяца",
+        "Последний год",
+        "Последние 2 года",
+        "Последние 3 года",
+        "Последние 4 года",
+        "Последние 5 лет",
+    ]
+    
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         selected_networks = st.multiselect(
@@ -609,6 +1493,16 @@ elif page == "📥 Загрузка данных":
         )
     
     with col2:
+        selected_period = st.selectbox(
+            "Период данных",
+            period_options,
+            index=1,  # Default to "Последний месяц"
+            help="За какой период загружать свопы и позиции"
+        )
+        period_hours = get_period_hours(selected_period)
+        st.caption(f"({period_hours // 24} дней / {period_hours} часов)")
+    
+    with col3:
         min_tvl = st.number_input(
             "Мин. TVL пула ($)",
             min_value=10000,
@@ -617,7 +1511,7 @@ elif page == "📥 Загрузка данных":
             help="Пулы с TVL меньше этого значения не загружаются"
         )
     
-    with col3:
+    with col4:
         positions_limit = st.number_input(
             "Лимит позиций на сеть",
             min_value=50,
@@ -632,18 +1526,74 @@ elif page == "📥 Загрузка данных":
         elif not GRAPH_API_KEY:
             st.error("GRAPH_API_KEY не настроен. Добавьте его в файл .env")
         else:
-            results = load_all_data_action(selected_networks, min_tvl, positions_limit)
+            results = load_all_data_action(selected_networks, min_tvl, positions_limit, hours=period_hours)
             
             st.success("✅ Загрузка завершена!")
             
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.markdown("**Пулы:**")
+                total_pools_loaded = 0
                 for net, count in results["pools"].items():
-                    st.write(f"• {net}: {count}")
+                    if isinstance(count, int):
+                        total_pools_loaded += count
+                        if count > 0:
+                            st.success(f"✅ {net}: {count}")
+                        else:
+                            st.warning(f"⚠️ {net}: {count} (нет пулов с TVL >= ${min_tvl:,.0f})")
+                    else:
+                        st.error(f"❌ {net}: {count}")
+                
+                if results.get("pools_detailed_errors"):
+                    with st.expander("🔍 Детали ошибок"):
+                        for err in results["pools_detailed_errors"]:
+                            st.text(f"  • {err}")
+                
+                if total_pools_loaded == 0 and not results.get("pools_error"):
+                    st.warning("⚠️ Пулы не загружены. Проверьте настройки.")
             with col2:
                 st.markdown("**Свопы:**")
-                st.write(f"• Загружено: {results['swaps']}")
+                if results.get("swap_warning"):
+                    st.warning(f"⚠️ {results['swap_warning']}")
+                    if results.get("swap_diagnostic"):
+                        diag = results["swap_diagnostic"]
+                        if diag.get("total_pools", 0) > 0:
+                            st.write(f"Всего пулов в базе: {diag['total_pools']}")
+                        if diag.get("pools_in_networks"):
+                            st.write(f"Пулов в выбранных сетях: {diag['pools_in_networks']}")
+                        if diag.get("available_networks"):
+                            st.write(f"Сети в базе: {', '.join(diag['available_networks'])}")
+                        if diag.get("requested_networks"):
+                            st.write(f"Запрошенные сети: {', '.join(diag['requested_networks'])}")
+                        if diag.get("max_tvl"):
+                            st.write(f"Макс. TVL в сетях: ${diag['max_tvl']:,.0f}")
+                        if diag.get("requested_min_tvl"):
+                            st.write(f"Запрошенный мин. TVL: ${diag['requested_min_tvl']:,.0f}")
+                        if diag.get("suggestion"):
+                            st.info(f"💡 {diag['suggestion']}")
+                else:
+                    st.write(f"• Загружено: {results['swaps']}")
+                    if results.get("total_swap_pools"):
+                        st.write(f"• Обработано пулов: {results.get('successful_swap_pools', 0)}/{results['total_swap_pools']}")
+                    
+                    # Show pools with swaps
+                    if results.get("pools_with_swaps"):
+                        with st.expander(f"✅ Пулы со свопами ({len(results['pools_with_swaps'])}):"):
+                            for pool_info in results["pools_with_swaps"][:10]:
+                                st.text(f"  • {pool_info}")
+                    
+                    # Show pools without swaps
+                    if results.get("pools_without_swaps"):
+                        with st.expander(f"⚠️ Пулы без свопов ({len(results['pools_without_swaps'])}):"):
+                            st.caption("Возможно, в этих пулах нет активности за выбранный период")
+                            for pool_info in results["pools_without_swaps"][:10]:
+                                st.text(f"  • {pool_info}")
+                    
+                    if results.get("swap_errors"):
+                        st.warning(f"⚠️ Ошибки в {len(results['swap_errors'])} пулах")
+                        with st.expander("Детали ошибок"):
+                            for err in results["swap_errors"][:5]:
+                                st.text(err)
             with col3:
                 st.markdown("**Позиции:**")
                 for net, data in results["positions"].items():
@@ -662,39 +1612,178 @@ elif page == "📥 Загрузка данных":
             st.markdown("Загрузить только пулы:")
             if st.button("Загрузить пулы"):
                 loader = PoolLoader()
+                total_loaded = 0
+                errors = []
+                
                 with st.spinner("Загрузка пулов..."):
+                    for net in selected_networks:
+                        try:
+                            with session_scope() as session:
+                                count = loader.load_pools_for_network(session, net, min_tvl=min_tvl)
+                                total_loaded += count
+                                
+                                # Verify pools were saved
+                                verify = session.query(Pool).filter(
+                                    Pool.network == net,
+                                    Pool.tvl_usd >= min_tvl
+                                ).count()
+                                
+                                if verify == 0 and count > 0:
+                                    errors.append(f"{net}: загружено {count}, но не сохранено в БД")
+                                elif verify > 0:
+                                    st.info(f"✅ {net}: загружено и сохранено {verify} пулов")
+                        except Exception as e:
+                            error_msg = f"{net}: {str(e)[:50]}"
+                            errors.append(error_msg)
+                            logger.error(f"Error loading pools from {net}: {e}", exc_info=True)
+                
+                if errors:
+                    st.warning(f"⚠️ Загружено {total_loaded} пулов, но были ошибки:")
+                    for err in errors:
+                        st.text(f"  • {err}")
+                elif total_loaded > 0:
+                    # Verify final count
                     with session_scope() as session:
-                        for net in selected_networks:
-                            loader.load_pools_for_network(session, net, min_tvl=min_tvl)
-                st.success("Пулы загружены!")
+                        final_count = session.query(Pool).filter(
+                            Pool.network.in_(selected_networks),
+                            Pool.tvl_usd >= min_tvl
+                        ).count()
+                        st.success(f"✅ Загружено и сохранено {final_count} пулов!")
+                else:
+                    st.error("❌ Не удалось загрузить пулы. Проверьте GRAPH_API_KEY и настройки.")
         
         with tab2:
             st.markdown("Загрузить только свопы:")
+            manual_period = st.selectbox(
+                "Период",
+                period_options,
+                index=1,
+                key="manual_swaps_period"
+            )
+            manual_swaps_hours = get_period_hours(manual_period)
+            manual_swaps_networks = st.multiselect(
+                "Сети",
+                available_networks,
+                default=selected_networks if selected_networks else [],
+                key="manual_swaps_networks"
+            )
+            test_mode = st.checkbox("Тестовый режим (показать детали)", key="test_swaps_mode")
+            
             if st.button("Загрузить свопы"):
-                with st.spinner("Загрузка свопов..."):
-                    with session_scope() as session:
-                        pools = session.query(Pool).filter(
-                            Pool.tvl_usd >= min_tvl
-                        ).order_by(Pool.tvl_usd.desc()).limit(30).all()
-                        loader = SwapLoader()
-                        for pool in pools:
-                            try:
-                                loader.load_swaps_for_pool(session, pool, limit=50)
-                            except:
-                                pass
-                st.success("Свопы загружены!")
+                if not manual_swaps_networks:
+                    st.error("Выберите хотя бы одну сеть")
+                else:
+                    with st.spinner("Загрузка свопов..."):
+                        total_swaps = 0
+                        errors = []
+                        pools_with_swaps = []
+                        pools_without_swaps = []
+                        
+                        with session_scope() as session:
+                            pools = session.query(Pool).filter(
+                                Pool.tvl_usd >= min_tvl,
+                                Pool.network.in_(manual_swaps_networks)
+                            ).order_by(Pool.tvl_usd.desc()).limit(30).all()
+                            
+                            if not pools:
+                                # Check what's in the database
+                                total_pools = session.query(Pool).count()
+                                pools_in_selected = session.query(Pool).filter(
+                                    Pool.network.in_(manual_swaps_networks)
+                                ).count()
+                                pools_above_tvl = session.query(Pool).filter(
+                                    Pool.tvl_usd >= min_tvl,
+                                    Pool.network.in_(manual_swaps_networks)
+                                ).count()
+                                
+                                st.warning("⚠️ Нет пулов для загрузки свопов")
+                                
+                                if total_pools == 0:
+                                    st.error("❌ В базе данных нет пулов! Перейдите на вкладку 'Пулы' и загрузите их.")
+                                elif pools_in_selected == 0:
+                                    st.warning(f"В базе нет пулов для сетей: {', '.join(manual_swaps_networks)}")
+                                    st.info(f"Всего пулов в базе: {total_pools}")
+                                elif pools_above_tvl == 0:
+                                    max_tvl = session.query(Pool.tvl_usd).filter(
+                                        Pool.network.in_(manual_swaps_networks)
+                                    ).order_by(Pool.tvl_usd.desc()).first()
+                                    max_tvl_val = float(max_tvl[0]) if max_tvl and max_tvl[0] else 0
+                                    st.warning(f"Нет пулов с TVL >= ${min_tvl:,.0f}")
+                                    st.info(f"Максимальный TVL: ${max_tvl_val:,.0f} | Пулов в сетях: {pools_in_selected}")
+                                    st.caption("💡 Попробуйте уменьшить 'Мин. TVL пула'")
+                            else:
+                                st.info(f"🔍 Проверяю {len(pools)} пулов за период {manual_swaps_hours // 24} дней...")
+                                loader = SwapLoader()
+                                
+                                for pool in pools:
+                                    try:
+                                        count = loader.load_swaps_for_pool(
+                                            session, pool, hours=manual_swaps_hours, limit=50
+                                        )
+                                        total_swaps += count
+                                        if count > 0:
+                                            pools_with_swaps.append(f"{pool.network}/{pool.token0_symbol}-{pool.token1_symbol} ({count} свопов)")
+                                        else:
+                                            pools_without_swaps.append(f"{pool.network}/{pool.token0_symbol}-{pool.token1_symbol} (адрес: {pool.address[:10]}...)")
+                                    except Exception as e:
+                                        error_msg = f"{pool.network}/{pool.token0_symbol}-{pool.token1_symbol}: {str(e)[:50]}"
+                                        errors.append(error_msg)
+                                        logger.error(f"Error loading swaps for pool {pool.address}: {e}", exc_info=True)
+                                
+                                # Show results
+                                if total_swaps > 0:
+                                    st.success(f"✅ Загружено {total_swaps} свопов из {len(pools_with_swaps)} пулов!")
+                                    if pools_with_swaps:
+                                        with st.expander(f"✅ Пулы со свопами ({len(pools_with_swaps)}):"):
+                                            for pool_info in pools_with_swaps:
+                                                st.text(f"  • {pool_info}")
+                                else:
+                                    st.warning(f"⚠️ Свопы не найдены в {len(pools)} пулах за выбранный период")
+                                    st.caption("💡 Попробуйте:")
+                                    st.caption("  • Увеличить период (например, 'Последний месяц')")
+                                    st.caption("  • Проверить, что пулы имеют активность")
+                                    st.caption("  • Убедиться, что пулы загружены правильно")
+                                
+                                if pools_without_swaps and test_mode:
+                                    with st.expander(f"🔍 Пулы без свопов ({len(pools_without_swaps)}):"):
+                                        for pool_info in pools_without_swaps[:20]:
+                                            st.text(f"  • {pool_info}")
+                                
+                                if errors:
+                                    st.warning(f"⚠️ Ошибки в {len(errors)} пулах")
+                                    with st.expander("Детали ошибок"):
+                                        for err in errors[:10]:
+                                            st.text(err)
         
         with tab3:
             st.markdown("Загрузить только позиции:")
+            manual_pos_period = st.selectbox(
+                "Период",
+                period_options,
+                index=1,
+                key="manual_positions_period"
+            )
+            manual_pos_hours = get_period_hours(manual_pos_period)
+            manual_networks = st.multiselect(
+                "Сети",
+                available_networks,
+                default=selected_networks if selected_networks else [],
+                key="manual_positions_networks"
+            )
             if st.button("Загрузить позиции"):
-                loader = PositionLoader()
-                with st.spinner("Загрузка позиций..."):
-                    results = loader.load_all_positions(
-                        networks=selected_networks,
-                        limit_per_network=positions_limit
-                    )
-                    calculate_positions_usd()
-                st.success(f"Позиции загружены: {results}")
+                if not manual_networks:
+                    st.error("Выберите хотя бы одну сеть")
+                else:
+                    loader = PositionLoader()
+                    with st.spinner("Загрузка позиций..."):
+                        with session_scope() as session:
+                            for network in manual_networks:
+                                loader.load_positions_from_events(
+                                    session, network, min_amount_usd="100", 
+                                    limit=positions_limit, hours=manual_pos_hours
+                                )
+                        calculate_positions_usd()
+                    st.success("Позиции загружены!")
 
 
 # =============================================================================

@@ -100,9 +100,9 @@ query getPools($first: Int!, $skip: Int!, $minTvl: BigDecimal!) {
     pools(
         first: $first
         skip: $skip
-        orderBy: totalValueLockedUSD
+        orderBy: volumeUSD
         orderDirection: desc
-        where: { totalValueLockedUSD_gte: $minTvl }
+        where: { totalValueLockedUSD_gte: $minTvl, volumeUSD_gt: "1000000" }
     ) {
         id
         token0 {
@@ -118,7 +118,6 @@ query getPools($first: Int!, $skip: Int!, $minTvl: BigDecimal!) {
             decimals
         }
         feeTier
-        tickSpacing
         liquidity
         sqrtPrice
         tick
@@ -261,6 +260,41 @@ query getPositions($first: Int!, $skip: Int!, $minLiquidity: BigInt!) {
         withdrawnToken1
         collectedFeesToken0
         collectedFeesToken1
+    }
+}
+"""
+
+# Count queries for period statistics
+MINTS_COUNT_QUERY = """
+query getMintsCount($startTime: BigInt!) {
+    mints(
+        first: 1000
+        where: { timestamp_gte: $startTime }
+    ) {
+        id
+    }
+}
+"""
+
+SWAPS_COUNT_QUERY = """
+query getSwapsCount($startTime: BigInt!) {
+    swaps(
+        first: 1000
+        where: { timestamp_gte: $startTime }
+    ) {
+        id
+    }
+}
+"""
+
+POSITIONS_COUNT_QUERY = """
+query getPositionsCount($startTime: BigInt!) {
+    positions(
+        first: 1000
+        where: { transaction_: { timestamp_gte: $startTime } }
+    ) {
+        id
+        owner
     }
 }
 """
